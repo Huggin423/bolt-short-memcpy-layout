@@ -1,0 +1,1116 @@
+diff --git a/bolt/docs/CommandLineArgumentReference.md b/bolt/docs/CommandLineArgumentReference.md
+--- a/bolt/docs/CommandLineArgumentReference.md
++++ b/bolt/docs/CommandLineArgumentReference.md
+@@ -697,6 +697,39 @@
+ - `--match-with-call-graph`
+ 
+   Match functions with call graph
++
++- `--memcpy-short-profile=<file>`
++
++  Enable profile-guided specialization of x86-64 ELF tail calls to
++  `memcpy@PLT`. Use this option with the standard libc `memcpy` contract,
++  since rewritten calls bypass symbol interposition. This option is
++  incompatible with `--inline-memcpy`.
++
++  The first non-comment line is `bolt-memcpy-profile-v1 <sha256>`, where
++  `<sha256>` is the digest of the input ELF. Each subsequent record contains
++  the original hexadecimal instruction address, the decimal observation
++  count, and 17 decimal counts for lengths 0 through 16. Blank lines and
++  comment lines starting with `#` are skipped. At least 10,000 observations
++  and at least 90% lengths of 16 bytes or less are required for a rewrite.
++  Supply the regular execution profile as usual.
++
++- `--memcpy-reuse-length-branch`
++
++  With a length profile, recognize an existing full-width zero check that
++  controls a supported memcpy tail call. Reuse it to dispatch short copies.
++  Sites without a proven match are skipped in this mode.
++
++- `--memcpy-reuse-long-fallthrough`
++
++  When reordering basic blocks for a reused check, place the original memcpy
++  path immediately after the check so that it can fall through.
++
++- `--layout-probe-outline-reused-short`
++
++  Place the added short blocks in a separate fragment during function splitting.
++  The experimental driver `bolt/utils/bolt_safe_layout.py` pairs this with a
++  reference layout and audits the emitted addresses and bytes. It outputs the
++  off baseline if it cannot verify a unique eligible function.
+ 
+ - `--memcpy1-spec=<func1,func2:cs1:cs2,func3:cs1,...>`
+ 
+diff --git a/bolt/include/bolt/Core/MCPlusBuilder.h b/bolt/include/bolt/Core/MCPlusBuilder.h
+--- a/bolt/include/bolt/Core/MCPlusBuilder.h
++++ b/bolt/include/bolt/Core/MCPlusBuilder.h
+@@ -2139,6 +2139,26 @@
+   virtual InstructionListType
+   createInlineMemcpy(bool ReturnEnd, std::optional<uint64_t> KnownSize) const {
+     return createInlineMemcpy(ReturnEnd);
++  }
++
++  enum class MemcpySizeCondition { Equal, Below, Above };
++
++  /// Compare the memcpy length against Size and branch to Target.
++  virtual InstructionListType
++  createMemcpySizeCheck(unsigned Size, MemcpySizeCondition Condition,
++                        const MCSymbol *Target, MCContext *Ctx) const {
++    llvm_unreachable("not implemented");
++  }
++
++  /// Copy a short memcpy with the given load/store width. Width zero returns
++  /// the destination without accessing memory.
++  virtual InstructionListType createShortMemcpy(unsigned Width) const {
++    llvm_unreachable("not implemented");
++  }
++
++  /// Inline memcpy using the full size_t length and return the destination.
++  virtual InstructionListType createFullSizeMemcpy() const {
++    llvm_unreachable("not implemented");
+   }
+ 
+   /// Extract immediate value from move instruction that sets the given
+diff --git a/bolt/include/bolt/Passes/BinaryPasses.h b/bolt/include/bolt/Passes/BinaryPasses.h
+--- a/bolt/include/bolt/Passes/BinaryPasses.h
++++ b/bolt/include/bolt/Passes/BinaryPasses.h
+@@ -492,6 +492,18 @@
+   Error runOnFunctions(BinaryContext &BC) override;
+ };
+ 
++/// Profile-guided specialization of x86-64 memcpy tail calls.
++class SpecializeMemcpyTails : public BinaryFunctionPass {
++  std::string ProfilePath;
++
++public:
++  SpecializeMemcpyTails(const cl::opt<bool> &PrintPass, StringRef ProfilePath)
++      : BinaryFunctionPass(PrintPass), ProfilePath(ProfilePath.str()) {}
++
++  const char *getName() const override { return "specialize-memcpy-tails"; }
++  Error runOnFunctions(BinaryContext &BC) override;
++};
++
+ /// Pass to remove nops in code
+ class RemoveNops : public BinaryFunctionPass {
+   void runOnFunction(BinaryFunction &Function);
+diff --git a/bolt/include/bolt/Utils/CommandLineOpts.h b/bolt/include/bolt/Utils/CommandLineOpts.h
+--- a/bolt/include/bolt/Utils/CommandLineOpts.h
++++ b/bolt/include/bolt/Utils/CommandLineOpts.h
+@@ -92,6 +92,7 @@
+ extern llvm::cl::opt<bool> CompactCodeModel;
+ extern llvm::cl::opt<bool> DiffOnly;
+ extern llvm::cl::opt<bool> EnableBAT;
++extern llvm::cl::opt<std::string> MemcpyShortProfile;
+ extern llvm::cl::opt<bool> EqualizeBBCounts;
+ extern llvm::cl::opt<bool> ForcePatch;
+ extern llvm::cl::opt<bool> RemoveSymtab;
+diff --git a/bolt/lib/Core/BinaryEmitter.cpp b/bolt/lib/Core/BinaryEmitter.cpp
+--- a/bolt/lib/Core/BinaryEmitter.cpp
++++ b/bolt/lib/Core/BinaryEmitter.cpp
+@@ -284,6 +284,11 @@
+   }
+ }
+ 
++static cl::opt<std::string> LayoutProbeRelaxAlignment(
++    "layout-probe-relax-alignment",
++    cl::desc("Use only minimum alignment for the named function's main fragment"),
++    cl::cat(opts::BoltOptCategory));
++
+ bool BinaryEmitter::emitFunction(BinaryFunction &Function,
+                                  FunctionFragment &FF) {
+   if (Function.size() == 0 && !Function.hasIslandsInfo())
+@@ -303,23 +308,29 @@
+   Section->setHasInstructions(true);
+   BC.Ctx->addGenDwarfSection(Section);
+ 
++  const bool LayoutProbe = BC.isX86() &&
++                           !LayoutProbeRelaxAlignment.empty() &&
++                           Function.hasName(LayoutProbeRelaxAlignment.getValue());
++  const bool Relax = LayoutProbe && !FF.isSplitFragment();
++  const Align Minimum = Relax ? Align(1) : Function.getMinAlign();
+   if (BC.HasRelocations) {
+     // Set section alignment to at least maximum possible object alignment.
+     // We need this to support LongJmp and other passes that calculates
+     // tentative layout.
+     Section->ensureMinAlignment(Align(BC.AlignFunctions));
+ 
+-    Streamer.emitCodeAlignment(Function.getMinAlign(), *BC.STI);
++    Streamer.emitCodeAlignment(Minimum, *BC.STI);
+     uint16_t MaxAlignBytes = FF.isSplitFragment()
+                                  ? Function.getMaxColdAlignmentBytes()
+                                  : Function.getMaxAlignmentBytes();
+-    if (MaxAlignBytes > 0)
++    if (MaxAlignBytes > 0 && !Relax)
+       Streamer.emitCodeAlignment(Function.getAlign(), *BC.STI, MaxAlignBytes);
+   } else {
+     Streamer.emitCodeAlignment(Function.getAlign(), *BC.STI);
+   }
+ 
+-  if (size_t Padding = opts::padFunctionBefore(Function)) {
++  if (size_t Padding = LayoutProbe && FF.isSplitFragment()
++                           ? 0 : opts::padFunctionBefore(Function)) {
+     // Handle padFuncsBefore after the above alignment logic but before
+     // symbol addresses are decided.
+     if (!BC.HasRelocations) {
+@@ -329,11 +340,11 @@
+     }
+ 
+     // Preserve Function.getMinAlign().
+-    if (!isAligned(Function.getMinAlign(), Padding)) {
++    if (!isAligned(Minimum, Padding)) {
+       BC.errs() << "BOLT-ERROR: user-requested " << Padding
+                 << " padding bytes before function " << Function
+                 << " is not a multiple of the minimum function alignment ("
+-                << Function.getMinAlign().value() << ").\n";
++                << Minimum.value() << ").\n";
+       exit(1);
+     }
+ 
+diff --git a/bolt/lib/Core/BinaryFunction.cpp b/bolt/lib/Core/BinaryFunction.cpp
+--- a/bolt/lib/Core/BinaryFunction.cpp
++++ b/bolt/lib/Core/BinaryFunction.cpp
+@@ -2591,9 +2591,12 @@
+   // does add non-trivial overhead and can get expensive -- that's why we don't
+   // add offsets to every single instruction.
+   if (!requiresPreciseAddressMap() && !opts::Instrument) {
++    // The length profile matches tail calls by their original input address.
++    const bool KeepTailCallOffsets = !opts::MemcpyShortProfile.empty();
+     for (BinaryBasicBlock &BB : blocks())
+       for (MCInst &Inst : BB)
+-        BC.MIB->clearOffset(Inst);
++        if (!KeepTailCallOffsets || !BC.MIB->isTailCall(Inst))
++          BC.MIB->clearOffset(Inst);
+   }
+ 
+   assert((!isSimple() || validateCFG()) &&
+diff --git a/bolt/lib/Passes/BinaryPasses.cpp b/bolt/lib/Passes/BinaryPasses.cpp
+--- a/bolt/lib/Passes/BinaryPasses.cpp
++++ b/bolt/lib/Passes/BinaryPasses.cpp
+@@ -15,13 +15,24 @@
+ #include "bolt/Core/ParallelUtilities.h"
+ #include "bolt/Passes/BranchLivenessUtils.h"
+ #include "bolt/Passes/RegAnalysis.h"
++#include "bolt/Passes/DataflowInfoManager.h"
+ #include "bolt/Passes/ReorderAlgorithm.h"
+ #include "bolt/Passes/ReorderFunctions.h"
+ #include "bolt/Utils/CommandLineOpts.h"
++#include "llvm/ADT/APInt.h"
+ #include "llvm/ADT/STLExtras.h"
++#include "llvm/ADT/StringExtras.h"
++#include "llvm/Support/Format.h"
++#include "llvm/Support/MathExtras.h"
++#include "llvm/Support/MemoryBuffer.h"
++#include "llvm/Support/SHA256.h"
++#include "llvm/Support/LineIterator.h"
+ #include "llvm/Support/CommandLine.h"
++#include <array>
+ #include <atomic>
+ #include <cmath>
++#include <iterator>
++#include <limits>
+ #include <mutex>
+ #include <numeric>
+ #include <optional>
+@@ -394,6 +405,43 @@
+   return Error::success();
+ }
+ 
++namespace {
++
++static cl::opt<bool> MemcpyReuseLongFallthrough(
++    "memcpy-reuse-long-fallthrough",
++    cl::desc("Keep the original libc path next to a reused length guard"),
++    cl::cat(opts::BoltOptCategory));
++constexpr StringLiteral MemcpyReuseAnchor = "MemcpyReuseAnchor";
++
++bool placeMemcpyLongFallthrough(BinaryFunction &BF) {
++  FunctionLayout &Layout = BF.getLayout();
++  MCPlusBuilder &MIB = *BF.getBinaryContext().MIB;
++  for (BinaryBasicBlock *Head : Layout.blocks()) {
++    if (!llvm::any_of(*Head, [&](const MCInst &Inst) {
++          return MIB.hasAnnotation(Inst, MemcpyReuseAnchor);
++        }))
++      continue;
++    const auto Branch = Head->getLastNonPseudo();
++    if (Branch == Head->rend() || !MIB.isConditionalBranch(*Branch) ||
++        MIB.getCondCode(*Branch) != 7) // x86 unsigned above
++      return false;
++    BinaryBasicBlock *Long = Head->getConditionalSuccessor(true);
++    if (!Long || Long->getFragmentNum() != Head->getFragmentNum())
++      return false;
++    SmallVector<BinaryBasicBlock *, 0> Order(Layout.block_begin(),
++                                             Layout.block_end());
++    auto Position = llvm::find(Order, Long);
++    if (Position == Order.end())
++      return false;
++    Order.erase(Position);
++    Order.insert(std::next(llvm::find(Order, Head)), Long);
++    return Layout.update(Order);
++  }
++  return false;
++}
++
++} // namespace
++
+ bool ReorderBasicBlocks::shouldPrint(const BinaryFunction &BF) const {
+   return (BinaryFunctionPass::shouldPrint(BF) &&
+           opts::ReorderBlocks != ReorderBasicBlocks::LT_NONE);
+@@ -425,8 +473,10 @@
+     if (opts::PrintFuncStat > 0)
+       llvm::copy(BF.getLayout().blocks(), std::back_inserter(OldBlockOrder));
+ 
+-    const bool LayoutChanged =
++    bool LayoutChanged =
+         modifyFunctionLayout(BF, opts::ReorderBlocks, opts::MinBranchClusters);
++    if (MemcpyReuseLongFallthrough)
++      LayoutChanged |= placeMemcpyLongFallthrough(BF);
+     if (LayoutChanged) {
+       ModifiedFuncCount.fetch_add(1, std::memory_order_relaxed);
+       if (opts::PrintFuncStat > 0) {
+@@ -2113,6 +2163,428 @@
+   return Error::success();
+ }
+ 
++namespace {
++
++constexpr unsigned ShortMemcpyLimit = 16;
++constexpr uint64_t MinMemcpySamples = 10000;
++
++struct MemcpyLengthProfile {
++  uint64_t Total = 0;
++  uint64_t Short = 0;
++  std::array<uint64_t, ShortMemcpyLimit + 1> Lengths{};
++};
++
++Expected<DenseMap<uint64_t, MemcpyLengthProfile>>
++readMemcpyTailProfile(StringRef Path, StringRef InputFile) {
++  auto Buffer = MemoryBuffer::getFile(Path, /*IsText=*/true);
++  if (!Buffer)
++    return createFileError(Path, Buffer.getError());
++  line_iterator Line(**Buffer, /*SkipBlanks=*/true, '#');
++  if (Line == line_iterator())
++    return createStringError(inconvertibleErrorCode(), "empty memcpy profile");
++
++  SmallVector<StringRef, 20> Fields;
++  SplitString(*Line, Fields);
++  if (Fields.size() != 2 || Fields[0] != "bolt-memcpy-profile-v1")
++    return createStringError(inconvertibleErrorCode(),
++                             "invalid memcpy profile header");
++
++  auto Input = MemoryBuffer::getFile(InputFile);
++  if (!Input)
++    return createFileError(InputFile, Input.getError());
++  const std::string Digest =
++      toHex(SHA256::hash(arrayRefFromStringRef((*Input)->getBuffer())));
++  if (!Fields[1].equals_insensitive(Digest))
++    return createStringError(inconvertibleErrorCode(),
++                             "memcpy profile SHA-256 does not match input ELF");
++
++  DenseMap<uint64_t, MemcpyLengthProfile> Profile;
++  for (++Line; Line != line_iterator(); ++Line) {
++    Fields.clear();
++    SplitString(*Line, Fields);
++    uint64_t Address;
++    MemcpyLengthProfile Site;
++    auto InvalidRecord = [&] {
++      return createStringError(inconvertibleErrorCode(),
++                               "invalid memcpy profile record at line %u",
++                               static_cast<unsigned>(Line.line_number()));
++    };
++    if (Fields.size() != Site.Lengths.size() + 2 ||
++        Fields[0].getAsInteger(16, Address) ||
++        Fields[1].getAsInteger(10, Site.Total) || !Site.Total)
++      return InvalidRecord();
++
++    for (auto [Field, Count] :
++         llvm::zip_equal(ArrayRef(Fields).drop_front(2), Site.Lengths)) {
++      if (Field.getAsInteger(10, Count) || Count > Site.Total - Site.Short)
++        return InvalidRecord();
++      Site.Short += Count;
++    }
++    if (!Profile.try_emplace(Address, Site).second)
++      return InvalidRecord();
++  }
++  return Profile;
++}
++
++struct MemcpyBucket {
++  unsigned First, Last, Width;
++};
++
++constexpr std::array<MemcpyBucket, 5> MemcpyBuckets = {
++    {{0, 0, 0}, {1, 1, 1}, {2, 3, 2}, {4, 7, 4}, {8, 16, 8}}};
++constexpr unsigned AllMemcpyBuckets = (1U << MemcpyBuckets.size()) - 1;
++
++using SizeCondition = MCPlusBuilder::MemcpySizeCondition;
++
++struct MemcpyDecision {
++  unsigned Bound = 0;
++  SizeCondition Condition = SizeCondition::Below;
++  unsigned Taken = 0;
++  unsigned Fallthrough = 0;
++};
++
++uint64_t scaleMemcpyCount(uint64_t Count, uint64_t Weight, uint64_t Total) {
++  if (!Total)
++    return 0;
++  return ((APInt(128, Count) * APInt(128, Weight)).udiv(Total)).getZExtValue();
++}
++
++void emitShortMemcpy(BinaryFunction &BF, BinaryBasicBlock &Short,
++                     int32_t CFIState, const MemcpyLengthProfile &Profile,
++                     unsigned Buckets) {
++  std::array<uint64_t, AllMemcpyBuckets + 1> Weights{};
++  for (unsigned I = 0; I < MemcpyBuckets.size(); ++I) {
++    const auto &B = MemcpyBuckets[I];
++    Weights[1U << I] =
++        std::accumulate(Profile.Lengths.begin() + B.First,
++                        Profile.Lengths.begin() + B.Last + 1, uint64_t(0));
++  }
++  std::array<MemcpyDecision, AllMemcpyBuckets + 1> Decisions{};
++  std::array<long double, AllMemcpyBuckets + 1> Costs{};
++  // Each proper subset has a smaller mask, so its best cost is ready.
++  for (unsigned Mask = 1; Mask <= AllMemcpyBuckets; ++Mask) {
++    if (llvm::isPowerOf2_32(Mask))
++      continue;
++    const unsigned First = Mask & (~Mask + 1);
++    Weights[Mask] = Weights[First] + Weights[Mask ^ First];
++    Costs[Mask] = std::numeric_limits<long double>::infinity();
++    for (unsigned I = 0; I < MemcpyBuckets.size() + 1; ++I) {
++      const bool Equal = I >= MemcpyBuckets.size() - 1;
++      const unsigned Bound = Equal ? I - (MemcpyBuckets.size() - 1)
++                                   : MemcpyBuckets[I + 1].First;
++      const unsigned Candidate = Equal ? 1U << Bound : (1U << (I + 1)) - 1;
++      const unsigned Taken = Mask & Candidate;
++      const unsigned Fallthrough = Mask ^ Taken;
++      if (!Taken || !Fallthrough)
++        continue;
++      const long double Cost = static_cast<long double>(Weights[Mask]) +
++                               Costs[Taken] + Costs[Fallthrough];
++      if (Cost < Costs[Mask]) {
++        Costs[Mask] = Cost;
++        Decisions[Mask] = {Bound,
++                           Equal ? SizeCondition::Equal : SizeCondition::Below,
++                           Taken, Fallthrough};
++      }
++    }
++  }
++
++  BinaryContext &BC = BF.getBinaryContext();
++  MCPlusBuilder &MIB = *BC.MIB;
++  auto NewBlock = [&] {
++    BinaryBasicBlock *BB = BF.addBasicBlock();
++    BB->setOffset(Short.getInputOffset());
++    BB->setCFIState(CFIState);
++    return BB;
++  };
++  auto Emit = [&](auto &&Self, BinaryBasicBlock &BB, unsigned Mask) -> void {
++    if (llvm::isPowerOf2_32(Mask)) {
++      const unsigned Width = MemcpyBuckets[llvm::countr_zero(Mask)].Width;
++      BB.addInstructions(MIB.createShortMemcpy(Width));
++      MCInst Ret;
++      MIB.createReturn(Ret);
++      BB.addInstruction(std::move(Ret));
++      return;
++    }
++    const auto &Decision = Decisions[Mask];
++    BinaryBasicBlock *Taken = NewBlock();
++    BinaryBasicBlock *Fallthrough = NewBlock();
++    const uint64_t TakenCount = scaleMemcpyCount(
++        BB.getExecutionCount(), Weights[Decision.Taken], Weights[Mask]);
++    Taken->setExecutionCount(TakenCount);
++    Fallthrough->setExecutionCount(BB.getExecutionCount() - TakenCount);
++    BB.addInstructions(MIB.createMemcpySizeCheck(
++        Decision.Bound, Decision.Condition, Taken->getLabel(), BC.Ctx.get()));
++    BB.addSuccessor(Taken, Taken->getExecutionCount());
++    BB.addSuccessor(Fallthrough, Fallthrough->getExecutionCount());
++    Self(Self, *Taken, Decision.Taken);
++    Self(Self, *Fallthrough, Decision.Fallthrough);
++  };
++  Emit(Emit, Short, Buckets);
++}
++
++void specializeMemcpyTail(BinaryFunction &BF, BinaryBasicBlock &Head,
++                          BinaryBasicBlock::iterator Tail,
++                          const MemcpyLengthProfile &Profile) {
++  BinaryContext &BC = BF.getBinaryContext();
++  MCPlusBuilder &MIB = *BC.MIB;
++  BinaryBasicBlock *Short = Head.splitAt(Tail);
++  Short->eraseInstruction(Short->begin());
++  Short->setOffset(Head.getInputOffset());
++
++  auto NewBlock = [&] {
++    BinaryBasicBlock *BB = BF.addBasicBlock();
++    BB->setOffset(Head.getInputOffset());
++    BB->setCFIState(Short->getCFIState());
++    return BB;
++  };
++
++  BinaryBasicBlock *Long = NewBlock();
++  Long->addInstructions(MIB.createFullSizeMemcpy());
++  MCInst Ret;
++  MIB.createReturn(Ret);
++  Long->addInstruction(std::move(Ret));
++
++  // Keep the conditional target first in the CFG. Layout passes choose
++  // the actual fall-through and update the conditional branch as needed.
++  auto AddBranch = [&](BinaryBasicBlock &BB, unsigned Bound,
++                       SizeCondition Condition, BinaryBasicBlock &Taken,
++                       BinaryBasicBlock &Fallthrough) {
++    BB.addInstructions(MIB.createMemcpySizeCheck(Bound, Condition,
++                                                 Taken.getLabel(), BC.Ctx.get()));
++    BB.addSuccessor(&Taken, Taken.getExecutionCount());
++    BB.addSuccessor(&Fallthrough, Fallthrough.getExecutionCount());
++  };
++  const uint64_t Count = Head.getKnownExecutionCount();
++  Short->setExecutionCount(scaleMemcpyCount(Count, Profile.Short, Profile.Total));
++  Long->setExecutionCount(Count - Short->getExecutionCount());
++  Head.removeAllSuccessors();
++  AddBranch(Head, ShortMemcpyLimit, SizeCondition::Above, *Long, *Short);
++
++  emitShortMemcpy(BF, *Short, Short->getCFIState(), Profile,
++                  AllMemcpyBuckets);
++}
++
++static cl::opt<bool> ReuseMemcpyLengthBranch(
++    "memcpy-reuse-length-branch",
++    cl::desc("Reuse a proven zero-length branch for memcpy tail specialization"),
++    cl::cat(opts::BoltOptCategory));
++
++struct MemcpyLengthBranch {
++  BinaryBasicBlock *Head;
++  BinaryBasicBlock *Zero;
++  MCPhysReg Reg;
++};
++
++// This first implementation handles a straight-line copy block with one
++// predecessor. Walk backwards from memcpy's length argument, following only
++// full-width copies and accepting calls only across callee-saved registers.
++std::optional<MemcpyLengthBranch>
++findMemcpyLengthBranch(BinaryFunction &BF, BinaryBasicBlock &Long,
++                       BinaryBasicBlock::iterator Tail, RegAnalysis &RA) {
++  BinaryContext &BC = BF.getBinaryContext();
++  MCPlusBuilder &MIB = *BC.MIB;
++  if (BF.isMultiEntry() || BF.hasJumpTables() || BF.hasEHRanges() ||
++      BF.getLSDAAddress() || Long.pred_size() != 1 || Long.isEntryPoint() ||
++      Long.isLandingPad())
++    return std::nullopt;
++  BinaryBasicBlock *Head = *Long.pred_begin();
++  if (Head == &Long || Head->succ_size() != 2 || Head->size() < 2)
++    return std::nullopt;
++  auto Branch = std::prev(Head->end());
++  auto Test = std::prev(Branch);
++  if (!MIB.isConditionalBranch(*Branch) ||
++      BC.MII->getName(Test->getOpcode()) != "TEST64rr" ||
++      !Test->getOperand(0).isReg() || !Test->getOperand(1).isReg() ||
++      Test->getOperand(0).getReg() != Test->getOperand(1).getReg())
++    return std::nullopt;
++  // X86 condition encodings for equality and inequality.
++  constexpr unsigned Equal = 4, NotEqual = 5;
++  const unsigned Condition = MIB.getCondCode(*Branch);
++  if ((Condition != Equal && Condition != NotEqual) ||
++      Head->getConditionalSuccessor(Condition == NotEqual) != &Long)
++    return std::nullopt;
++  BinaryBasicBlock *Zero = Head->getConditionalSuccessor(Condition == Equal);
++  if (Zero == Head || Zero == &Long || Zero->pred_size() != 1 ||
++      Zero->isEntryPoint() || Zero->isLandingPad() ||
++      Zero->getFirstNonPseudo() == Zero->end())
++    return std::nullopt;
++  if (Head->getCFIStateAtExit() != Long.getCFIState() ||
++      Head->getCFIStateAtExit() != Zero->getCFIState())
++    return std::nullopt;
++
++  MCPhysReg Reg = MIB.getIntArgRegister(2);
++  BitVector Saved(BC.MRI->getNumRegs()), Clobbered(BC.MRI->getNumRegs());
++  MIB.getCalleeSavedRegs(Saved);
++  for (auto I = std::make_reverse_iterator(Tail); I != Long.rend(); ++I) {
++    if (MIB.isPseudo(*I))
++      continue;
++    if (MIB.isBranch(*I) || MIB.isReturn(*I) || MIB.isInvoke(*I))
++      return std::nullopt;
++    if (MIB.isCall(*I)) {
++      if (!MIB.getTargetSymbol(*I) || !Saved.test(Reg))
++        return std::nullopt;
++      continue;
++    }
++    Clobbered.reset();
++    MIB.getClobberedRegs(*I, Clobbered);
++    if (!Clobbered.anyCommon(MIB.getAliases(Reg)))
++      continue;
++    if (BC.MII->getName(I->getOpcode()) != "MOV64rr" ||
++        I->getOperand(0).getReg() != Reg)
++      return std::nullopt;
++    Reg = I->getOperand(1).getReg();
++  }
++  if (Reg != Test->getOperand(0).getReg())
++    return std::nullopt;
++  DataflowInfoManager Info(BF, &RA, nullptr);
++  auto &Liveness = Info.getLivenessAnalysis();
++  const MCPhysReg Flags = MIB.getFlagsReg();
++  if (Liveness.isAlive(&*Long.getFirstNonPseudo(), Flags) ||
++      Liveness.isAlive(&*Zero->getFirstNonPseudo(), Flags))
++    return std::nullopt;
++  return MemcpyLengthBranch{Head, Zero, Reg};
++}
++
++void reuseMemcpyLengthBranch(BinaryFunction &BF, BinaryBasicBlock &Long,
++                             BinaryBasicBlock::iterator Tail,
++                             MemcpyLengthBranch Match,
++                             const MemcpyLengthProfile &Profile) {
++  BinaryContext &BC = BF.getBinaryContext();
++  MCPlusBuilder &MIB = *BC.MIB;
++  BinaryBasicBlock &Head = *Match.Head;
++  BinaryBasicBlock &Zero = *Match.Zero;
++  const uint64_t NonzeroCount = Long.getKnownExecutionCount();
++  const uint64_t ZeroCount = Zero.getKnownExecutionCount();
++  const uint64_t ShortCount =
++      scaleMemcpyCount(NonzeroCount, Profile.Short - Profile.Lengths[0],
++                       Profile.Total - Profile.Lengths[0]);
++
++  BinaryBasicBlock &Dispatch = *BF.addBasicBlock();
++  Dispatch.setOffset(Zero.getInputOffset());
++  Dispatch.setCFIState(Zero.getCFIState());
++  Dispatch.setExecutionCount(ShortCount + ZeroCount);
++
++  BinaryBasicBlock &Prep = *BF.addBasicBlock();
++  Prep.setOffset(Long.getInputOffset());
++  Prep.setCFIState(Long.getCFIState());
++  Prep.setExecutionCount(ShortCount);
++  for (auto I = Long.begin(); I != Tail; ++I) {
++    MCInst Copy = *I;
++    // The duplicate has no unique original address for translation.
++    if (!MIB.isPseudo(Copy))
++      MIB.clearOffset(Copy);
++    Prep.addInstruction(std::move(Copy));
++  }
++  const int32_t CopyCFI = Long.getCFIStateAtInstr(&*Tail);
++
++  auto LongCheck = MIB.createMemcpySizeCheck(
++      ShortMemcpyLimit, SizeCondition::Above, Long.getLabel(), BC.Ctx.get());
++  LongCheck.front().getOperand(0).setReg(Match.Reg);
++  if (MemcpyReuseLongFallthrough)
++    MIB.addAnnotation(LongCheck.front(), MemcpyReuseAnchor, true);
++  Head.eraseInstruction(std::prev(Head.end()));
++  Head.eraseInstruction(std::prev(Head.end()));
++  Head.addInstructions(LongCheck);
++  Long.setExecutionCount(NonzeroCount - ShortCount);
++  Head.removeAllSuccessors();
++  Head.addSuccessor(&Long, Long.getExecutionCount());
++  Head.addSuccessor(&Dispatch, Dispatch.getExecutionCount());
++
++  Dispatch.addInstructions(
++      MIB.createCmpJE(Match.Reg, 0, Zero.getLabel(), BC.Ctx.get()));
++  Dispatch.addSuccessor(&Zero, ZeroCount);
++  Dispatch.addSuccessor(&Prep, ShortCount);
++  emitShortMemcpy(BF, Prep, CopyCFI, Profile, AllMemcpyBuckets & ~1U);
++  // Tag only the newly emitted dispatch and its short-copy tree.
++  MIB.addAnnotation(*Dispatch.getFirstNonPseudo(), "MemcpyReusedShort", true);
++  SmallVector<BinaryBasicBlock *, 8> ShortBlocks{&Prep};
++  while (!ShortBlocks.empty()) {
++    BinaryBasicBlock *BB = ShortBlocks.pop_back_val();
++    MIB.addAnnotation(*BB->getFirstNonPseudo(), "MemcpyReusedShort", true);
++    llvm::append_range(ShortBlocks, BB->successors());
++  }
++}
++
++
++} // namespace
++
++Error SpecializeMemcpyTails::runOnFunctions(BinaryContext &BC) {
++  if (!BC.isELF() || BC.TheTriple->getArch() != Triple::x86_64)
++    return createStringError(inconvertibleErrorCode(),
++                             "--memcpy-short-profile requires x86-64 ELF");
++
++  auto Profile = readMemcpyTailProfile(ProfilePath, BC.getFilename());
++  if (!Profile)
++    return Profile.takeError();
++
++  uint64_t NumSpecialized = 0;
++  MCPlusBuilder &MIB = *BC.MIB;
++  RegAnalysis RA(BC, nullptr, nullptr);
++  RA.setConservativeStrategy(RegAnalysis::ConservativeStrategy::CLOBBERS_ABI);
++  for (auto &BFI : BC.getBinaryFunctions()) {
++    BinaryFunction &BF = BFI.second;
++    if (!shouldOptimize(BF) || !BC.shouldEmit(BF))
++      continue;
++
++    // Rewriting adds blocks, so walk a snapshot of the original blocks.
++    SmallVector<BinaryBasicBlock *, 0> Blocks(BF.pbegin(), BF.pend());
++    for (BinaryBasicBlock *BB : Blocks) {
++      if (!BB->getKnownExecutionCount() || BB->succ_size())
++        continue;
++      auto Tail = BB->getLastNonPseudo();
++      if (Tail == BB->rend() || !MIB.isTailCall(*Tail) ||
++          MIB.getConditionalTailCall(*Tail) ||
++          MCPlus::getNumPrimeOperands(*Tail) != 1)
++        continue;
++      const MCSymbol *Callee = MIB.getTargetSymbol(*Tail);
++      if (!Callee || Callee->getName() != "memcpy@PLT")
++        continue;
++
++      auto Offset = MIB.getOffset(*Tail);
++      if (!Offset)
++        continue;
++      const uint64_t Address = BF.getAddress() + *Offset;
++      auto It = Profile->find(Address);
++      if (It == Profile->end())
++        continue;
++      const MemcpyLengthProfile &Site = It->second;
++      if (Site.Total < MinMemcpySamples ||
++          Site.Short < Site.Total - Site.Total / 10)
++        continue;
++
++      auto TailInst = std::prev(Tail.base());
++      if (ReuseMemcpyLengthBranch) {
++        auto Match = findMemcpyLengthBranch(BF, *BB, TailInst, RA);
++        if (!Match) {
++          if (opts::Verbosity)
++            BC.outs() << "BOLT-INFO: no reusable length branch in "
++                      << BF.getPrintName() << " at " << format_hex(Address, 0)
++                      << '\n';
++          continue;
++        }
++        reuseMemcpyLengthBranch(BF, *BB, TailInst, *Match, Site);
++        BC.outs() << "BOLT-INFO: reused memcpy length branch in "
++                  << BF.getPrintName() << " at " << format_hex(Address, 0)
++                  << '\n';
++        ++NumSpecialized;
++        // One transform per function keeps the copied region and the
++        // original matches independent.
++        break;
++      }
++      specializeMemcpyTail(BF, *BB, TailInst, Site);
++      ++NumSpecialized;
++      if (opts::Verbosity)
++        BC.outs() << "BOLT-INFO: specialized memcpy tail in "
++                  << BF.getPrintName() << " at " << format_hex(Address, 0)
++                  << " (" << Site.Short << '/' << Site.Total
++                  << " short copies)\n";
++    }
++  }
++  BC.outs() << "BOLT-INFO: specialized " << NumSpecialized
++            << " memcpy tail call sites using a length profile\n";
++  return Error::success();
++}
++
+ void RemoveNops::runOnFunction(BinaryFunction &BF) {
+   const BinaryContext &BC = BF.getBinaryContext();
+   for (BinaryBasicBlock &BB : BF) {
+diff --git a/bolt/lib/Passes/SplitFunctions.cpp b/bolt/lib/Passes/SplitFunctions.cpp
+--- a/bolt/lib/Passes/SplitFunctions.cpp
++++ b/bolt/lib/Passes/SplitFunctions.cpp
+@@ -786,6 +786,11 @@
+   return Error::success();
+ }
+ 
++static cl::opt<bool> LayoutProbeOutlineReusedShort(
++    "layout-probe-outline-reused-short",
++    cl::desc("Place the new reused-length short path out of the main fragment"),
++    cl::cat(opts::BoltOptCategory));
++
+ void SplitFunctions::splitFunction(BinaryFunction &BF, SplitStrategy &S) {
+   if (BF.empty())
+     return;
+@@ -853,6 +858,13 @@
+ 
+   BF.getLayout().updateLayoutIndices();
+   S.fragment(NewLayout.begin(), NewLayout.end());
++
++  if (LayoutProbeOutlineReusedShort)
++    for (BinaryBasicBlock *BB : NewLayout)
++      if (BB->canOutline() && llvm::any_of(*BB, [&](const MCInst &Inst) {
++            return BC.MIB->hasAnnotation(Inst, "MemcpyReusedShort");
++          }))
++        BB->setFragmentNum(FragmentNum::cold());
+ 
+   // Make sure all non-outlineable blocks are in the main-fragment.
+   for (BinaryBasicBlock *const BB : NewLayout) {
+diff --git a/bolt/lib/Rewrite/BinaryPassManager.cpp b/bolt/lib/Rewrite/BinaryPassManager.cpp
+--- a/bolt/lib/Rewrite/BinaryPassManager.cpp
++++ b/bolt/lib/Rewrite/BinaryPassManager.cpp
+@@ -369,6 +369,11 @@
+ }
+ 
+ Error BinaryFunctionPassManager::runAllPasses(BinaryContext &BC) {
++  if (!opts::MemcpyShortProfile.empty() && opts::StringOps)
++    return createStringError(inconvertibleErrorCode(),
++                             "--memcpy-short-profile and --inline-memcpy "
++                             "cannot be used together");
++
+   BinaryFunctionPassManager Manager(BC);
+ 
+   if (BC.isAArch64())
+@@ -433,6 +438,10 @@
+   Manager.registerPass(
+       std::make_unique<SpecializeMemcpy1>(NeverPrint, opts::SpecializeMemcpy1),
+       !opts::SpecializeMemcpy1.empty());
++
++  if (!opts::MemcpyShortProfile.empty())
++    Manager.registerPass(std::make_unique<SpecializeMemcpyTails>(
++        NeverPrint, opts::MemcpyShortProfile.getValue()));
+ 
+   Manager.registerPass(std::make_unique<InlineMemcpy>(NeverPrint),
+                        opts::StringOps);
+diff --git a/bolt/lib/Target/X86/X86MCPlusBuilder.cpp b/bolt/lib/Target/X86/X86MCPlusBuilder.cpp
+--- a/bolt/lib/Target/X86/X86MCPlusBuilder.cpp
++++ b/bolt/lib/Target/X86/X86MCPlusBuilder.cpp
+@@ -2403,7 +2403,7 @@
+     Inst.clear();
+   }
+ 
+-  InstructionListType createInlineMemcpy(bool ReturnEnd) const override {
++  InstructionListType createRepMemcpy(bool ReturnEnd, bool FullSize) const {
+     InstructionListType Code;
+     if (ReturnEnd)
+       Code.emplace_back(MCInstBuilder(X86::LEA64r)
+@@ -2418,12 +2418,20 @@
+                             .addReg(X86::RAX)
+                             .addReg(X86::RDI));
+ 
+-    Code.emplace_back(MCInstBuilder(X86::MOV32rr)
+-                          .addReg(X86::ECX)
+-                          .addReg(X86::EDX));
++    Code.emplace_back(MCInstBuilder(FullSize ? X86::MOV64rr : X86::MOV32rr)
++                          .addReg(FullSize ? X86::RCX : X86::ECX)
++                          .addReg(FullSize ? X86::RDX : X86::EDX));
+     Code.emplace_back(MCInstBuilder(X86::REP_MOVSB_64));
+ 
+     return Code;
++  }
++
++  InstructionListType createInlineMemcpy(bool ReturnEnd) const override {
++    return createRepMemcpy(ReturnEnd, /*FullSize=*/false);
++  }
++
++  InstructionListType createFullSizeMemcpy() const override {
++    return createRepMemcpy(/*ReturnEnd=*/false, /*FullSize=*/true);
+   }
+ 
+   InstructionListType createOneByteMemcpy() const override {
+@@ -2445,6 +2453,76 @@
+     Code.emplace_back(MCInstBuilder(X86::MOV64rr)
+                           .addReg(X86::RAX)
+                           .addReg(X86::RDI));
++    return Code;
++  }
++
++  InstructionListType
++  createMemcpySizeCheck(unsigned Size, MemcpySizeCondition Condition,
++                        const MCSymbol *Target, MCContext *Ctx) const override {
++    if (Condition == MemcpySizeCondition::Equal)
++      return createCmpJE(X86::RDX, Size, Target, Ctx);
++    InstructionListType Code;
++    Code.emplace_back(
++        MCInstBuilder(X86::CMP64ri8).addReg(X86::RDX).addImm(Size));
++    createCondBranch(Code.emplace_back(), Target,
++                     Condition == MemcpySizeCondition::Below ? X86::COND_B
++                                                              : X86::COND_A,
++                     Ctx);
++    return Code;
++  }
++
++  InstructionListType createShortMemcpy(unsigned Width) const override {
++    if (Width == 1)
++      return createOneByteMemcpy();
++
++    InstructionListType Code;
++    if (Width) {
++      unsigned Load, Store;
++      MCPhysReg Head, Tail;
++      switch (Width) {
++      case 2:
++        Load = X86::MOV16rm;
++        Store = X86::MOV16mr;
++        Head = X86::CX;
++        Tail = X86::R8W;
++        break;
++      case 4:
++        Load = X86::MOV32rm;
++        Store = X86::MOV32mr;
++        Head = X86::ECX;
++        Tail = X86::R8D;
++        break;
++      case 8:
++        Load = X86::MOV64rm;
++        Store = X86::MOV64mr;
++        Head = X86::RCX;
++        Tail = X86::R8;
++        break;
++      default:
++        llvm_unreachable("unsupported short memcpy width");
++      }
++
++      // Cover the interval with a load/store at each end. Both accesses
++      // stay within the requested length for this width.
++      auto AddAddress = [Width](MCInstBuilder Builder, MCPhysReg Base,
++                                bool AtEnd) {
++        return Builder.addReg(Base)
++            .addImm(1)
++            .addReg(AtEnd ? X86::RDX : X86::NoRegister)
++            .addImm(AtEnd ? -static_cast<int>(Width) : 0)
++            .addReg(X86::NoRegister);
++      };
++      Code.emplace_back(
++          AddAddress(MCInstBuilder(Load).addReg(Head), X86::RSI, false));
++      Code.emplace_back(
++          AddAddress(MCInstBuilder(Load).addReg(Tail), X86::RSI, true));
++      Code.emplace_back(AddAddress(MCInstBuilder(Store), X86::RDI, false)
++                            .addReg(Head));
++      Code.emplace_back(AddAddress(MCInstBuilder(Store), X86::RDI, true)
++                            .addReg(Tail));
++    }
++    Code.emplace_back(
++        MCInstBuilder(X86::MOV64rr).addReg(X86::RAX).addReg(X86::RDI));
+     return Code;
+   }
+ 
+diff --git a/bolt/lib/Utils/CommandLineOpts.cpp b/bolt/lib/Utils/CommandLineOpts.cpp
+--- a/bolt/lib/Utils/CommandLineOpts.cpp
++++ b/bolt/lib/Utils/CommandLineOpts.cpp
+@@ -120,6 +120,11 @@
+   cl::desc("write BOLT Address Translation tables"),
+   cl::init(false),
+   cl::cat(BoltCategory));
++
++cl::opt<std::string> MemcpyShortProfile(
++    "memcpy-short-profile",
++    cl::desc("specialize x86-64 ELF memcpy tail calls using a length profile"),
++    cl::value_desc("file"), cl::cat(BoltOptCategory));
+ 
+ cl::opt<bool> EqualizeBBCounts(
+     "equalize-bb-counts",
+diff --git a/bolt/utils/bolt_safe_layout.py b/bolt/utils/bolt_safe_layout.py
+new file mode 100644
+--- /dev/null
++++ b/bolt/utils/bolt_safe_layout.py
+@@ -0,0 +1,204 @@
++# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++"""Generate a BOLT candidate and admit it only after an ELF layout audit."""
++import argparse
++import hashlib
++import json
++import re
++import shutil
++import struct
++import subprocess
++from dataclasses import dataclass
++from pathlib import Path
++
++from elfaudit import read as audit_elf
++
++
++@dataclass(frozen=True)
++class Instruction:
++    address: int
++    opcode: str
++    operands: str
++
++
++def instructions(binary, symbol):
++    code = subprocess.check_output(
++        ['objdump', '-d', '--no-show-raw-insn', f'--disassemble={symbol}', binary],
++        text=True)
++    items = re.findall(r'^[ \t]*([0-9a-f]+):[ \t]+([a-z][a-z0-9.]*)[ \t]*(.*)$',
++                       code, re.M)
++    return [Instruction(int(address, 16), opcode, operands)
++            for address, opcode, operands in items], code
++
++
++def tail_index(code):
++    tails = [i for i, inst in enumerate(code)
++             if inst.opcode == 'jmp' and re.search(r'<memcpy@(?:plt|GLIBC[^>]*)>', inst.operands)]
++    return tails[0] if len(tails) == 1 and tails[0] + 1 < len(code) else None
++
++
++def reference_path(code):
++    tail = tail_index(code)
++    if tail is None:
++        return None
++    for index in range(tail - 1, 0, -1):
++        inst = code[index]
++        if inst.opcode.startswith('j') or inst.opcode.startswith('ret'):
++            if inst.opcode not in ('je', 'jz') or code[index - 1].opcode != 'test':
++                return None
++            return code[index + 1].address, code[tail].address, code[tail + 1].address
++    return None
++
++
++def candidate_path(code, sections):
++    tail = tail_index(code)
++    if tail is None or '.text.cold' not in sections:
++        return None
++    cold = sections['.text.cold']
++    for index in range(tail - 1, 0, -1):
++        inst = code[index]
++        if inst.opcode.startswith('j') or inst.opcode.startswith('ret'):
++            if inst.opcode not in ('jbe', 'jna') or code[index - 1].opcode != 'cmp':
++                return None
++            target = re.match(r'([0-9a-f]+)\s', inst.operands)
++            if not target or not cold['addr'] <= int(target[1], 16) < cold['addr'] + cold['size']:
++                return None
++            return code[index + 1].address, code[tail].address, code[tail + 1].address
++    return None
++
++
++def virtual_bytes(binary, start, end):
++    data = binary.read_bytes()
++    assert data[:6] == b'\x7fELF\x02\x01'
++    table, = struct.unpack_from('<Q', data, 32)
++    entry_size, count = struct.unpack_from('<HH', data, 54)
++    for entry in range(count):
++        kind, flags, offset, address, _, size, _, _ = struct.unpack_from(
++            '<IIQQQQQQ', data, table + entry * entry_size)
++        if kind == 1 and flags & 1 and address <= start <= end <= address + size:
++            return data[offset + start - address:offset + end - address]
++    raise ValueError('the long path is not in one executable segment')
++
++
++def hot_symbols(sections, names, changed):
++    text = sections['.text']
++    end = text['addr'] + text['size']
++    return {name: (symbol['addr'], symbol['size'])
++            for name, symbol in names.items()
++            if name != changed and text['addr'] <= symbol['addr'] < end}
++
++
++def digest(path):
++    return hashlib.sha256(path.read_bytes()).hexdigest()
++
++
++def run(args):
++    out = args.directory.resolve()
++    out.mkdir(parents=True, exist_ok=False)
++    order = out / 'reference.order'
++    base = out / 'off'
++    final = out / 'selected'
++    common = ['--strict', '--reorder-blocks=ext-tsp', '--reorder-functions=cdsort',
++              '--split-functions', '--split-all-cold', '--plt=all', '--verify-cfg',
++              '--thread-count=1', '--enable-bat', '-v=1']
++    details = {'mode': 'off', 'input_sha256': digest(args.input),
++               'profile_sha256': digest(args.length_profile), 'runs': {}}
++
++    def generate(name, flags, *, ordered=False):
++        binary = out / name
++        options = common.copy()
++        if ordered:
++            options[options.index('--reorder-functions=cdsort')] = '--reorder-functions=user'
++            options.append(f'--function-order={order}')
++        command = [str(args.bolt), str(args.input), f'-data={args.data}',
++                   '-o', str(binary), *options, *flags]
++        log = out / (name + '.bolt.log')
++        with log.open('w') as file:
++            process = subprocess.run(command, stdout=file, stderr=subprocess.STDOUT)
++        details['runs'][name] = {'command': command, 'exit_code': process.returncode}
++        return binary if process.returncode == 0 else None, log.read_text()
++
++    def finish(binary, reason):
++        shutil.copy2(binary, final)
++        details['reason'] = reason
++        details['outputs'] = {'off': digest(base), 'selected': digest(final)}
++        (out / 'plan.json').write_text(json.dumps(details, indent=2) + '\n')
++        print(details['mode'], reason, flush=True)
++
++    generated, _ = generate('off', [f'--generate-function-order={order}'])
++    if not generated:
++        raise RuntimeError('BOLT failed to generate the off baseline')
++    optimize = [f'--memcpy-short-profile={args.length_profile}',
++                '--memcpy-reuse-length-branch', '--memcpy-reuse-long-fallthrough',
++                '--layout-probe-outline-reused-short']
++    draft, messages = generate('discovery', optimize, ordered=True)
++    if not draft:
++        return finish(base, 'BOLT rejected the discovery build')
++    matches = re.findall(r'^BOLT-INFO: reused memcpy length branch in (\S+) at (0x[0-9a-f]+)',
++                         messages, re.M)
++    details['matches'] = matches
++    if len(matches) != 1:
++        return finish(base, 'this implementation requires one unambiguous eligible function')
++    symbol, site = matches[0]
++    if not re.fullmatch(r'[A-Za-z0-9_.$-]+', symbol):
++        return finish(base, 'function name cannot be represented unambiguously by the layout options')
++    off_sections, off_symbols = audit_elf(base)
++    off_code, off_asm = instructions(base, symbol)
++    (out / 'off.asm').write_text(off_asm)
++    off_path = reference_path(off_code)
++    if not off_path or symbol not in off_symbols or '.text' not in off_sections:
++        return finish(base, 'the reference libc path could not be located unambiguously')
++
++    relax = [*optimize, f'--layout-probe-relax-alignment={symbol}']
++    probe, messages = generate('unpadded', relax, ordered=True)
++    if not probe:
++        return finish(base, 'BOLT rejected the unpadded layout')
++    probe_sections, _ = audit_elf(probe)
++    probe_code, _ = instructions(probe, symbol)
++    probe_path = candidate_path(probe_code, probe_sections)
++    if not probe_path or probe_path[2] - probe_path[0] != off_path[2] - off_path[0]:
++        return finish(base, 'the long path is not contiguous or its encoded size changed')
++    pad = off_path[1] - probe_path[1]
++    details['inferred_padding'] = pad
++    if not 0 <= pad <= args.padding_budget:
++        return finish(base, 'the layout requires more placement space than the configured budget')
++
++    candidate_flags = [*relax, f'--pad-funcs-before={symbol}:{pad}'] if pad else relax
++    candidate, messages = generate('candidate', candidate_flags, ordered=True)
++    if not candidate:
++        return finish(base, 'BOLT rejected the calculated placement')
++    final_matches = re.findall(
++        r'^BOLT-INFO: reused memcpy length branch in (\S+) at (0x[0-9a-f]+)',
++        messages, re.M)
++    if final_matches != [(symbol, site)]:
++        return finish(base, 'the final build did not reproduce the discovered match')
++    sections, names = audit_elf(candidate)
++    if '.text' not in sections:
++        return finish(base, 'the candidate has no auditable main text section')
++    code, assembly = instructions(candidate, symbol)
++    (out / 'candidate.asm').write_text(assembly)
++    path = candidate_path(code, sections)
++    checks = {
++        'long_start_tail_and_end_match': path == off_path,
++        'long_machine_code_matches': bool(path and path == off_path
++            and virtual_bytes(base, off_path[0], off_path[2]) ==
++            virtual_bytes(candidate, path[0], path[2])),
++        'other_hot_function_addresses_and_sizes_match':
++            hot_symbols(off_sections, off_symbols, symbol) == hot_symbols(sections, names, symbol),
++        'main_text_address_and_size_match':
++            tuple(off_sections['.text'][k] for k in ('addr', 'size')) ==
++            tuple(sections['.text'][k] for k in ('addr', 'size')),
++    }
++    details['layout_checks'] = checks
++    details['long_path'] = {'reference': off_path, 'candidate': path}
++    if not all(checks.values()):
++        return finish(base, 'the emitted layout failed the address or code audit')
++    details['mode'] = 'optimized'
++    finish(candidate, 'the emitted layout passed all checks')
++
++
++if __name__ == '__main__':
++    parser = argparse.ArgumentParser(description=__doc__)
++    for name in ('bolt', 'input', 'data', 'length-profile', 'directory'):
++        parser.add_argument(f'--{name}', type=lambda path: Path(path).resolve(), required=True)
++    parser.add_argument('--padding-budget', type=int, default=64)
++    run(parser.parse_args())
+diff --git a/bolt/utils/elfaudit.py b/bolt/utils/elfaudit.py
+new file mode 100644
+--- /dev/null
++++ b/bolt/utils/elfaudit.py
+@@ -0,0 +1,21 @@
++# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++import struct,hashlib,json,sys
++from pathlib import Path
++def read(p):
++ b=Path(p).read_bytes();assert b[:6]==b'\x7fELF\x02\x01'
++ off=struct.unpack_from('<Q',b,40)[0];ents,namesidx=struct.unpack_from('<H',b,58)[0],struct.unpack_from('<H',b,62)[0];n=struct.unpack_from('<H',b,60)[0]
++ ss=[struct.unpack_from('<IIQQQQIIQQ',b,off+i*ents) for i in range(n)];t=ss[namesidx];names=b[t[4]:t[4]+t[5]]
++ out={};syms={}
++ for s in ss:
++  k=names[s[0]:].split(b'\0')[0].decode()
++  if s[2]&2:out[k]={'addr':s[3],'size':s[5],'sha':hashlib.sha256(b[s[4]:s[4]+s[5]] if s[1]!=8 else b'').hexdigest()}
++  if s[1]==2:
++   t=ss[s[6]];st=b[t[4]:t[4]+t[5]]
++   for j in range(s[4],s[4]+s[5],s[9]):
++    nm,info,other,idx,addr,size=struct.unpack_from('<IBBHQQ',b,j)
++    if info&15!=2 or not size or idx>=len(ss):continue
++    name=st[nm:].split(b'\0')[0].decode();sec=ss[idx];pos=sec[4]+addr-sec[3]
++    syms[name]={'addr':addr,'size':size,'sha':hashlib.sha256(b[pos:pos+size]).hexdigest()}
++ return out,syms
++if __name__=='__main__':
++ a,sa=read(sys.argv[1]);b,sb=read(sys.argv[2]);d={'alloc_equal':a==b,'different_sections':[k for k in a.keys()|b.keys() if a.get(k)!=b.get(k)],'functions':[{'name':k,'before':sa.get(k),'after':sb.get(k)} for k in sa.keys()|sb.keys() if sa.get(k)!=sb.get(k)]};print(json.dumps(d,indent=2))
